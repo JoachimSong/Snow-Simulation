@@ -1,0 +1,71 @@
+﻿#define THREAD_X 8
+#define THREAD_Y 8
+#define THREAD_Z 8
+
+#pragma kernel Render
+#pragma kernel Clear
+
+//所有质点的位置
+RWStructuredBuffer<float3> positions;
+//所有质点的体积
+RWStructuredBuffer<float3> sizes;
+//所有质点的相态 参数 x雪占比，y水占比，z冰占比, w温度
+RWStructuredBuffer<float4> states;
+//体纹理
+RWTexture3D<float> volumeTexture;
+
+float3 gridCount;//xyz方向上grid的数量
+float gridSize;
+float3 gridPosition;
+int particleCount;
+int particleCountPerDim;
+
+static uint getIndex(uint3 id) {
+	return id.z * particleCountPerDim * particleCountPerDim + id.y * particleCountPerDim + id.x;
+}
+
+static bool isValidateId(uint3 id) {
+	return getIndex(id) < particleCount;
+}
+
+static uint3 getGridNum(uint index) {
+	float3 pos = positions[index];
+	float3 gridStartPos = gridPosition - gridCount * gridSize / 2;
+	uint index_X = floor((pos.x - gridStartPos.x) / gridSize);
+	uint index_Y = floor((pos.y - gridStartPos.y) / gridSize);
+	uint index_Z = floor((pos.z - gridStartPos.z) / gridSize);
+	return uint3(index_X, index_Y, index_Z);
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void Render(int3 id : SV_DispatchThreadID)
+{
+	if (!isValidateId(id))
+		return;
+	uint index = getIndex(id);
+
+	uint3 gridNum = getGridNum(index);
+	volumeTexture[gridNum] = 1;
+	//float3 size = sizes[index];
+	//uint3 renderSize = uint3(ceil(size.x / gridSize), ceil(size.y / gridSize), ceil(size.z / gridSize));
+	//renderSize = (renderSize / 2) * 2 + 1;//渲染周围多少格子
+	//for (int i = 0; i < renderSize.x; i++) {
+	//	for (int j = 0; i < renderSize.y; j++) {
+	//		for (int k = 0; i < renderSize.z; k++) {
+	//			uint3 tmpGridNum = gridNum - renderSize / 2 + uint3(i, j, k);
+	//			volumeTexture[tmpGridNum] = 1;//TODO:雪水冰分别渲染
+	//		}
+	//	}
+	//}
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void Clear(int3 id : SV_DispatchThreadID)
+{
+	if (!isValidateId(id))
+		return;
+	uint index = getIndex(id);
+
+	uint3 gridNum = getGridNum(index);
+	volumeTexture[gridNum] = 0;
+}

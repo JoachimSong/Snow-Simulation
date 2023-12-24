@@ -1,0 +1,794 @@
+﻿#define THREAD_X 8
+#define THREAD_Y 8
+#define THREAD_Z 8
+#define E_Snow 5000
+
+#pragma kernel Init
+#pragma kernel CalcHash
+#pragma kernel BitonicSort
+#pragma kernel FindCellStart
+#pragma kernel StepV
+#pragma kernel StepP
+#pragma kernel StepQ
+
+struct block
+{
+    float3 position;
+    float3 rotation;
+    float3 countPerDim;
+};
+struct ball
+{
+    float3 position;
+    float3 rotation;
+    float3 scale;
+    float3 count;
+};
+//雪块
+RWStructuredBuffer<block> blocks;
+//雪球
+RWStructuredBuffer<ball> balls;
+//所有质点的位置
+RWStructuredBuffer<float3> positions;
+//所有质点的速度
+RWStructuredBuffer<float3> velocities;
+//所有质点的体积
+RWStructuredBuffer<float3> sizes;
+//所有质点的相态 参数 x雪占比，y水占比，z冰占比, w温度
+RWStructuredBuffer<float4> states;
+
+RWStructuredBuffer<uint> count;
+//x表示曾遇到过的最大邻居数量 y表示是否有断裂的键
+RWStructuredBuffer<uint2> haveBrokenBonds;
+//参数 x表示η，y表示β，z表示T
+//RWStructuredBuffer<float4> parameters;
+
+RWStructuredBuffer<uint2> particleHash;
+
+RWStructuredBuffer<uint2> cellStartEnd;
+
+RWStructuredBuffer<uint3> particleGrid;//大小等同于网格数量
+
+RWStructuredBuffer<uint> totalVolume; 
+
+RWTexture3D<float> tempTexture;//大小等同于网格数量
+
+//雪块数量
+uint blockCount;
+//雪球数量
+uint ballCount;
+
+uint particleCount;
+
+uint particleCountPerDim;
+
+float particleSize;
+
+float mass;
+
+float Cd;
+
+float dt;
+
+float gridSize;//grid边长
+
+float tangentialCOF;//切向力摩擦系数
+
+uint3 gridCount;//xyz方向上grid的数量
+
+uint outerLoop;
+
+uint innerLoop;
+
+uint sortThreadSize;//用于排序的线程数量
+
+uint cellOffset;
+
+float3 gridStartPos;
+
+float Kq = 0.00005;    //Kq为耐久度变化系数
+float initialDensity;
+float initialTotalVolume; //粒子总体积
+float density;
+
+///球形碰撞体
+uniform float4 collisionBall;
+//立方体形状的碰撞体
+uniform float4 collisionCube;
+
+uniform float4 collisionPlayer;
+
+static uint getIndex(uint3 id) {
+    return id.z * particleCountPerDim * particleCountPerDim + id.y * particleCountPerDim + id.x;
+}
+
+static bool isValidateId(uint3 id) {
+    return getIndex(id) < particleCount;
+}
+
+static bool isValidateIndexForSort(uint index) {
+    return index < sortThreadSize;
+}
+
+static bool isValidateIndexForHash(uint index) {
+    return index < sortThreadSize * 2;
+}
+
+static float3 getPosition(uint index) {
+    return positions[index];
+}
+
+
+static float3 getVelocity(uint index) {
+    return velocities[index];
+}
+
+static void setVelocity(uint index, float3 vel) {
+    velocities[index] = vel;
+}
+
+static void setPosition(uint index, float3 pos) {
+    positions[index] = pos;
+}
+
+static float Distance(float3 a, float3 b)
+{
+    float3 diff = a - b;
+    return sqrt(dot(diff, diff));
+}
+
+static void hashBufferSwap(uint index1, uint index2, bool descend) {
+    if (!descend) {
+        //升序
+        if (particleHash[index1].x > particleHash[index2].x) {
+            uint2 tmp = particleHash[index1];
+            particleHash[index1] = particleHash[index2];
+            particleHash[index2] = tmp;
+        }
+    }
+    else {
+        if (particleHash[index1].x < particleHash[index2].x) {
+            uint2 tmp = particleHash[index1];
+            particleHash[index1] = particleHash[index2];
+            particleHash[index2] = tmp;
+        }
+    }
+
+}
+
+//计算塑性压缩的阈值函数D(αi)由图中近似雪的应力 - 密度曲线形状计算得到 输入参数为雪堆的密度？
+static float thresholdD(float rho) {
+    float Fminw = 9.8 * mass * 1.05;    //FminW是粒子在初始压缩之前所能承受的最小力的常数。它被定义为一个大小略大于mg的值。
+    float Fmaxw = 9.8 * mass * 100000;     //常数FmaxW是一个粒子可以承受的最大力，它被设置为一个相对较高的值。
+    float tmp = exp((rho / 100) - 1);
+    float q = (tmp - 0.000335) / 2980.96;
+    float D = Fminw + q * Fmaxw;
+    return D;
+}
+
+//计算粒子的初始总体积
+//static void CalculateTotalVolume(uint index) {
+//    float3 size = sizes[index];
+//    float diameter = size.x; // 假设直径存储在 float3 的 x 分量中
+//    float radius = diameter / 2.0;
+//    float volume = 4 * 3.14 * radius * radius * radius / 3;
+//    InterlockedAdd(initialTotalVolume, volume);
+//    InterlockedAdd(totalVolume, volume);
+//    //totalVolume += volume;
+//}
+
+//计算粒子的总体积
+//static void RecalculateTotalVolume(uint index) {
+//    float3 size = sizes[index];
+//    float diameter = size.x; // 假设直径存储在 float3 的 x 分量中
+//    float radius = diameter / 2.0;
+//    float volume = 4 * 3.14 * radius * radius * radius / 3;
+//    totalVolume += volume;
+//}
+
+// 当粒子发生大小变化时，重新计算密度
+static void RecalculateDensity()
+{
+    //float totalVolume = RecalculateTotalVolume();
+    
+    // 重新计算密度
+    float totalMass = initialTotalVolume * initialDensity;
+    density = 100000 * totalMass / totalVolume[0];
+}
+
+static float3 calculateF(uint index, float3 position, float3 velocity) {
+    float3 f = float3(0, 0, 0);
+    //阻尼力
+    float3 fd = -Cd * velocity;
+    f += fd;
+
+    //重力
+    float3 fg = float3(0, -9.8, 0) * mass;
+    f += fg;
+
+    uint3 gridNum = particleGrid[index];
+    //限制范围 防止超出网格
+    uint start_X = gridNum.x > 0 ? gridNum.x - 1 : 0;
+    uint end_X = gridNum.x < gridCount.x - 1 ? gridNum.x + 1 : gridCount.x - 1;
+    uint start_Y = gridNum.y > 0 ? gridNum.y - 1 : 0;
+    uint end_Y = gridNum.y < gridCount.y - 1 ? gridNum.y + 1 : gridCount.y - 1;
+    uint start_Z = gridNum.z > 0 ? gridNum.z - 1 : 0;
+    uint end_Z = gridNum.z < gridCount.z - 1 ? gridNum.z + 1 : gridCount.z - 1;
+    //遍历周围27个格子 寻找邻居节点
+    uint neighborCount = 0;
+    for (uint i = start_X; i <= end_X; i++) {
+        for (uint j = start_Y; j <= end_Y; j++) {
+            for (uint k = start_Z; k <= end_Z; k++) {
+                uint neighborHash = k * gridCount.x * gridCount.y + j * gridCount.x + i;
+                uint neighborStart = cellStartEnd[neighborHash].x;
+                uint neighborEnd = cellStartEnd[neighborHash].y;
+                if (!(neighborStart == 0 )) {
+                    for (uint m = neighborStart; m <= neighborEnd; m++) {
+                        //获取邻居节点的对应index值
+                        uint neighborIndex = particleHash[m].y;
+                        //排除自己
+                        if (neighborIndex != index) {
+                            //TODO:邻居节点相关计算
+                            float curRadius = sizes[index].x / 2;
+                            float delta = -Distance(position, positions[neighborIndex]) + curRadius + sizes[neighborIndex].x / 2;
+                            float3 diff = -normalize(position - positions[neighborIndex]);
+                            //邻居节点统计增加
+                            neighborCount++;
+
+                            //内聚力计算
+                            if (haveBrokenBonds[index].y == 0 && haveBrokenBonds[neighborIndex].y == 0) {
+                                if (-delta < 0.5 * curRadius) {
+                                    float3 cohesionF = -E_Snow * curRadius * delta * diff;
+                                    f += cohesionF;
+                                    if (delta > 0) {
+                                        float3 curV = velocities[index];
+                                        float3 neighborV = velocities[neighborIndex];
+                                        float3 relativeV = curV - neighborV;
+                                        if (length(relativeV) >= 0.001) {
+                                            float3 tangentialF = normalize(relativeV) * -tangentialCOF * length(cohesionF);
+                                            f += tangentialF;
+                                        }
+                                    }
+                                }
+                            }
+                            else {
+                                if (delta > 0) {
+                                    float3 cohesionF = -E_Snow * curRadius * delta * diff;
+                                    f += cohesionF;
+                                    //切向阻力
+                                    float3 curV = velocities[index];
+                                    float3 neighborV = velocities[neighborIndex];
+                                    float3 relativeV = curV - neighborV;
+                                    if (length(relativeV) >= 0.001) {
+                                        float3 tangentialF = normalize(relativeV) * -tangentialCOF * length(cohesionF);
+                                        f += tangentialF;
+                                    }
+                                }
+                            }
+
+
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    //计算体积压缩：
+    //RecalculateTotalVolume();
+
+    float radius = sizes[index].x / 2.0;
+    uint volume = uint(100000 * 4 * 3.14 * radius * radius * radius / 3);
+    InterlockedAdd(totalVolume[0], -volume);
+    //totalVolume = totalVolume - volume;
+    float S = 3.14 * radius * radius;
+    float pc = length(f) / S;
+    if (length(f) > thresholdD(density) && (sizes[index].x * 0.9 > particleSize * 0.6)) {
+        sizes[index].x = sizes[index].x * (1 - Kq * pc);
+        sizes[index].y = sizes[index].y * (1 - Kq * pc);
+        sizes[index].z = sizes[index].z * (1 - Kq * pc);
+        sizes[index] *= (1 - dt/2);
+    }
+    radius = sizes[index].x / 2.0;
+    volume = uint(100000 * 4 * 3.14 * radius * radius * radius / 3);
+    InterlockedAdd(totalVolume[0], volume);
+    //totalVolume = totalVolume + volume;
+
+
+    if (haveBrokenBonds[index].y == 0) {
+        //在上一步中键未断裂，在这一步中判断是否断裂
+        if (neighborCount > haveBrokenBonds[index].x) {
+            haveBrokenBonds[index].x = neighborCount;
+        }
+        if (float(neighborCount) < 0.75 * haveBrokenBonds[index].x) {
+            haveBrokenBonds[index].y = 1;
+        }
+    }
+    //与地面摩擦计算
+    if (position.y <= 0.0002) {
+        float horizontalV = length(float2(velocity.x, velocity.z));
+        if (horizontalV >= 0.01) {
+            float2 horizontalDir = normalize(float2(velocity.x, velocity.z));
+            float verticalF = f.y;
+            if (verticalF < 0) {
+                f.x -= horizontalDir.x * abs(verticalF) * 0.5;
+                f.z -= horizontalDir.y * abs(verticalF) * 0.5;
+                f.y = 0;
+            }
+            else {
+                //f.x = 0;
+                //f.z = 0;
+                //f.y = 0;
+                //velocities[index] = float3(0, 0, 0);
+            }
+        }
+        else {
+            float horizontalF = length(float2(f.x, f.z));
+            float verticalF = f.y;
+            if (abs(horizontalF) < 100 * abs(verticalF)) {
+                f = float3(0, 0, 0);
+                velocities[index] = float3(0, 0, 0);
+            }
+        }
+    }
+    return f;
+}
+
+static float3 calculateF(uint index) {
+    return calculateF(index, getPosition(index), getVelocity(index));
+}
+
+static void detectBallCollision(uint3 id) {
+    uint index = getIndex(id);
+    float3 pos = getPosition(index);
+    float3 bCenter = collisionBall.xyz;
+    float bRaidus = collisionBall.w;
+    float disToBall = distance(pos, bCenter) - bRaidus;
+    if (disToBall < 0) {
+        float3 e = normalize(pos - bCenter);    //计算球体表面碰撞点到碰撞球中心的单位向量
+        pos = pos - disToBall * e;  // 将球体的位置坐标减去球体与碰撞球之间的重叠距离乘以单位向量 e，即将球体移出碰撞球。
+
+        float3 v = getVelocity(index);
+
+        v = v - dot(v, e) * e;   //考虑与法线同方向的分量完全被吸收
+        //由于雪不能想粒子一样有太大的弹性，所以我们需要给他设置一个速度的粘滞系数miu，让它慢慢减速
+        float miu = 0.95;
+        v = v * miu;
+
+        if ((sizes[index].x * 0.9 > particleSize * 0.3)) {
+            sizes[index] *= (1 - 0.1);//压缩一下碰到的粒子
+        }
+
+        setVelocity(index, v);
+        setPosition(index, pos);
+
+    }
+}
+
+//add 6/11
+static void detectCubeCollision(uint3 id) {
+    uint index = getIndex(id);
+    float3 pos = getPosition(index);
+    float3 velocity = getVelocity(index);
+
+    // 获取传入的立方体参数
+    float3 cubeCenter = collisionCube.xyz;
+    float cubeHalfSize = collisionCube.w;
+
+    // 计算粒子在立方体内部的偏移量
+    float3 offset = abs(pos - cubeCenter) - float3(cubeHalfSize, cubeHalfSize, cubeHalfSize);
+    float3 penetration = max(offset, 0.0);
+    float penetrationDistance = length(penetration);
+
+    // 立方体碰撞检测
+    if (penetrationDistance < particleSize) {
+        // 碰撞发生，修正粒子位置和速度
+        float3 normal = normalize(penetration);
+        pos += normal * (particleSize / 2 - penetrationDistance); // 将粒子移出立方体
+        velocity -= 1.05 * dot(velocity, normal) * normal; // 只保留大部分与碰撞面平行的速度分量，反弹小部分垂直速度分量
+    }
+
+    setPosition(index, pos);
+    setVelocity(index, velocity);
+}
+
+static void detectPlayerCollision(uint3 id) {
+    uint index = getIndex(id);
+    float3 pos = getPosition(index);
+    float3 pCenter = collisionPlayer.xyz;
+    pCenter.y = pos.y;
+    float pRaidus = collisionPlayer.w;
+    float disToPlayer = distance(pos, pCenter) - pRaidus;
+    if (disToPlayer < 0) {
+        float3 e = normalize(pos - pCenter);    //计算球体表面碰撞点到碰撞球中心的单位向量
+        pos = pos - disToPlayer * e;  // 将球体的位置坐标减去球体与碰撞球之间的重叠距离乘以单位向量 e，即将球体移出碰撞球。
+
+        float3 v = getVelocity(index);
+
+        v = v - dot(v, e) * e;   //考虑与法线同方向的分量完全被吸收
+        //由于雪不能想粒子一样有太大的弹性，所以我们需要给他设置一个速度的粘滞系数miu，让它慢慢减速
+        float miu = 0.95;
+        v = v * miu;
+        setVelocity(index, v);
+        setPosition(index, pos);
+    }
+}
+
+//新的思路
+
+//static void detectCubeCollision(uint3 id)
+//{
+//    uint index = getIndex(id);
+//    float3 pos = getPosition(index);
+//    float3 velocity = getVelocity(index);
+//
+//    // 获取传入的立方体参数
+//    float3 cubeMin = collisionCube.xyz - float3(collisionCube.w, collisionCube.w, collisionCube.w);
+//    float3 cubeMax = collisionCube.xyz + float3(collisionCube.w, collisionCube.w, collisionCube.w);
+//
+//    // 判断粒子是否在立方体内部
+//    bool isInsideCube = pos.x >= cubeMin.x && pos.x <= cubeMax.x &&
+//        pos.y >= cubeMin.y && pos.y <= cubeMax.y &&
+//        pos.z >= cubeMin.z && pos.z <= cubeMax.z;
+//
+//    // 如果粒子在立方体内部
+//    if (isInsideCube)
+//    {
+//        // 计算粒子与立方体各个面的距离
+//        float distXMin = pos.x - cubeMin.x;
+//        float distXMax = cubeMax.x - pos.x;
+//        float distYMin = pos.y - cubeMin.y;
+//        float distYMax = cubeMax.y - pos.y;
+//        float distZMin = pos.z - cubeMin.z;
+//        float distZMax = cubeMax.z - pos.z;
+//
+//        // 找到与粒子最近的面
+//        float minDist = min(min(min(distXMin, distXMax), min(distYMin, distYMax)), min(distZMin, distZMax));
+//        float3 collisionNormal = float3(0, 0, 0);
+//        if (minDist == distXMin)
+//        {
+//            collisionNormal.x = -1.0;
+//        }
+//        else if (minDist == distXMax)
+//        {
+//            collisionNormal.x = 1.0;
+//        }
+//        else if (minDist == distYMin)
+//        {
+//            collisionNormal.y = -1.0;
+//        }
+//        else if (minDist == distYMax)
+//        {
+//            collisionNormal.y = 1.0;
+//        }
+//        else if (minDist == distZMin)
+//        {
+//            collisionNormal.z = -1.0;
+//        }
+//        else if (minDist == distZMax)
+//        {
+//            collisionNormal.z = 1.0;
+//        }
+//
+//        // 将粒子移出立方体，并将与碰撞面垂直的速度分量置零
+//        float padding = 0.01;
+//        pos -= collisionNormal * (minDist - particleSize/2);
+//        velocity *= float3(1.0 - abs(collisionNormal.x), 1.0 - abs(collisionNormal.y), 1.0 - abs(collisionNormal.y));
+//    }
+//
+//    setPosition(index, pos);
+//    setVelocity(index, velocity);
+//}
+
+//add 6/11
+
+static void detectWallCollision(uint3 id) {
+    uint index = getIndex(id);
+    float padding = 0.0001;
+    float3 pos = getPosition(index);
+    float3 v = getVelocity(index);
+    if (pos.x <= gridStartPos.x) {
+        pos.x = gridStartPos.x + padding;
+        v.x *= -1;
+    }
+    if (pos.x >= gridStartPos.x + gridSize * gridCount.x) {
+        pos.x = gridStartPos.x + gridSize * gridCount.x - padding;
+        v.x *= -1;
+    }
+    if (pos.z <= gridStartPos.z) {
+        pos.z = gridStartPos.z + padding;
+        v.z *= -1;
+    }
+    if (pos.z >= gridStartPos.z + gridSize * gridCount.z) {
+        pos.z = gridStartPos.z + gridSize * gridCount.z - padding;
+        v.z *= -1;
+    }
+    setVelocity(index, v);
+    setPosition(index, pos);
+}
+
+static void stepVelocity(uint3 id) {
+    uint index = getIndex(id);
+    float3 f = calculateF(index);
+    float3 a = f * rcp(mass);
+    float3 v = getVelocity(index) + a * dt;
+    //float3 v = float3(0, 0, 0);
+    setVelocity(index, v);
+}
+
+
+static void stepPosition(uint3 id) {
+    uint index = getIndex(id);
+    float3 v = getVelocity(index);
+    float3 pos = getPosition(index) + v * dt;
+    if (pos.y <= 0) {
+        pos.y = 0.0001;
+    }
+    setPosition(index, pos);
+    detectBallCollision(id);
+    detectWallCollision(id);
+    detectCubeCollision(id);
+    detectPlayerCollision(id);
+}
+
+static void calculateHash(uint3 id) {
+    
+    uint index = getIndex(id);
+    if (!isValidateId(id)) {
+        //particleHash[index] = uint2(0, index);
+        return;
+    }
+    float3 pos = getPosition(index);
+    uint index_X = floor((pos.x - gridStartPos.x) / gridSize);
+    uint index_Y = floor((pos.y - gridStartPos.y) / gridSize);
+    uint index_Z = floor((pos.z - gridStartPos.z) / gridSize);
+    uint hash = index_Z * gridCount.x * gridCount.y + index_Y * gridCount.x + index_X;
+    particleHash[index+cellOffset] = uint2(hash, index);
+    particleGrid[index] = uint3(index_X, index_Y, index_Z);
+}
+
+static void findCellStart(uint3 id) {
+    uint index = getIndex(id);
+    if (index > 0 && index < particleCount - 1) {
+        uint curIndex = particleHash[index + cellOffset].x;
+        uint preIndex = particleHash[index - 1 + cellOffset].x;
+        if (curIndex != preIndex) {
+            cellStartEnd[curIndex].x = index + cellOffset;
+            cellStartEnd[preIndex].y = index - 1 + cellOffset;
+        }
+    }
+    else if (index == 0) {
+        uint curIndex = particleHash[index + cellOffset].x;
+        cellStartEnd[curIndex].x = cellOffset;
+        RecalculateDensity();
+    }
+    else if (index == particleCount - 1) {
+        uint curIndex = particleHash[index + cellOffset].x;
+        cellStartEnd[curIndex].y = particleCount - 1 + cellOffset;
+    }
+}
+
+
+
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    if (!isValidateId(id))
+        return;
+    uint index = getIndex(id);
+    velocities[index] = float3(0, 0, 0);
+    sizes[index] = float3(particleSize, particleSize, particleSize);
+    states[index] = float4(1, 0, 0, 0);
+    haveBrokenBonds[index].x = 0;
+    haveBrokenBonds[index].y = 0;
+
+    uint blockNum, ballNum, particleNum;
+    for (blockNum = 0; blockNum < blockCount; blockNum++)
+    {
+        particleNum += blocks[blockNum].countPerDim.x * blocks[blockNum].countPerDim.y * blocks[blockNum].countPerDim.z;
+        if (index < particleNum)
+            break;
+    }
+    if (blockNum < blockCount)
+    {
+        float3 blockPos = blocks[blockNum].position;
+        float3 blockRot = blocks[blockNum].rotation;
+        int3 countPerDim = blocks[blockNum].countPerDim;
+        int3 localPos = int3(index % countPerDim.x, (index / countPerDim.x) % countPerDim.y, (index / (countPerDim.x * countPerDim.y)) % countPerDim.z);
+        positions[index] = blockPos - 0.5 * particleSize * (countPerDim - float3(1, 1, 1)) + localPos * particleSize;
+        //TODO 计算方块旋转
+        return;
+    }
+    for (ballNum = 0; ballNum < ballCount; ballNum++)
+    {
+        particleNum += balls[ballNum].count.x;
+        if (index < particleNum)
+            break;
+    }
+    if (ballNum < ballCount)
+    {
+        float3 ballPos = balls[ballNum].position;
+        float3 ballRot = balls[ballNum].rotation;
+        int count = balls[ballNum].count.x;
+        //TODO 计算球内粒子位置
+        float3 localPos = float3(0, 0, 0);
+        positions[index] = ballPos + localPos;
+    }
+
+    //CalculateTotalVolume(index);
+}
+
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void CalcHash(uint3 id : SV_DispatchThreadID)
+{
+    uint index = getIndex(id);
+    //if (!isValidateIndexForHash(index)) {
+    //    return;
+    //}
+    //particleHash[index] = uint2(0, 0);
+    if (!isValidateIndexForHash(index))
+        return;
+    calculateHash(id);
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void BitonicSort(uint3 id : SV_DispatchThreadID)
+{
+    uint index = getIndex(id);
+    if (!isValidateIndexForSort(index))
+        return;
+    index *= 2;
+    uint cellSize = 2 << outerLoop;
+    //是否降序
+    uint cellIndex = index / cellSize;
+    bool descend = cellIndex % 2;
+    if (index % 2 == 0) {
+        uint offset = 1 << innerLoop;
+        uint subCellSize = 2 << innerLoop;
+        uint actualIndex = ((index / subCellSize) * subCellSize) + ((index % subCellSize) / 2);
+        hashBufferSwap(actualIndex, actualIndex + offset, descend);
+    }
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void FindCellStart(uint3 id : SV_DispatchThreadID)
+{
+    if (!isValidateId(id))
+        return;
+    findCellStart(id);
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void StepV(uint3 id : SV_DispatchThreadID)
+{
+    if (!isValidateId(id))
+        return;
+    stepVelocity(id);
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void StepP(uint3 id : SV_DispatchThreadID)
+{
+    if (!isValidateId(id))
+        return;
+    stepPosition(id);
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void StepQ(uint3 id : SV_DispatchThreadID)
+{
+    if (!isValidateId(id))
+        return;
+    uint index = getIndex(id);
+
+    float CpSnow = 2.09;
+    float CpWater = 4.186;
+    float CpIce = 2.05;
+    float htSnow = 0.1;
+    float htWater = 0.602;
+    float htIce = 0.7;
+    float Qwater = 331;//冰变水吸热
+    uint maxNeighborCount = 20;//小于这个值时，受到空气或地面的传热
+
+    float4 thisState = states[index];
+    float Cp = CpSnow * thisState.x + CpWater * thisState.y + CpIce * thisState.z;
+    float ht = htSnow * thisState.x + htWater * thisState.y + htIce * thisState.z;
+    float Q = 0;
+
+
+    uint3 gridNum = particleGrid[index];
+    //限制范围 防止超出网格
+    uint start_X = gridNum.x > 0 ? gridNum.x - 1 : 0;
+    uint end_X = gridNum.x < gridCount.x - 1 ? gridNum.x + 1 : gridCount.x - 1;
+    uint start_Y = gridNum.y > 0 ? gridNum.y - 1 : 0;
+    uint end_Y = gridNum.y < gridCount.y - 1 ? gridNum.y + 1 : gridCount.y - 1;
+    uint start_Z = gridNum.z > 0 ? gridNum.z - 1 : 0;
+    uint end_Z = gridNum.z < gridCount.z - 1 ? gridNum.z + 1 : gridCount.z - 1;
+    //遍历周围27个格子 寻找邻居节点
+    uint neighborCount = 0;
+    for (uint i = start_X; i <= end_X; i++) {
+        for (uint j = start_Y; j <= end_Y; j++) {
+            for (uint k = start_Z; k <= end_Z; k++) {
+                uint neighborHash = k * gridCount.x * gridCount.y + j * gridCount.x + i;
+                uint neighborStart = cellStartEnd[neighborHash].x;
+                uint neighborEnd = cellStartEnd[neighborHash].y;
+                if (!(neighborStart == 0 )) {
+                    for (uint i = neighborStart; i <= neighborEnd; i++) {
+                        //获取邻居节点的对应index值
+                        uint neighborIndex = particleHash[i].y;
+                        //排除自己
+                        if (neighborIndex != index) {
+                            neighborCount++;
+                            float4 neighborState = states[neighborIndex];
+                            //邻居节点热量计算
+                            Q += (CpSnow * neighborState.x + CpWater * neighborState.y + CpIce * neighborState.z) * (neighborState.w - thisState.w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (neighborCount < maxNeighborCount) {
+        /*SamplerState linearClampSampler
+        {
+            Filter = Linear;
+            AddressU = Clamp;
+            AddressV = Clamp;
+            AddressW = Clamp;
+        };
+        float3 texPos = float3((float)gridNum.x / gridCount.x, (float)gridNum.y / gridCount.y, (float)gridNum.z / gridCount.z);*/
+        float Tair = tempTexture[gridNum];
+
+        
+        Q += ht * (Tair - thisState.w) * (1 - neighborCount / maxNeighborCount) * 4;
+    }
+    Q *= dt;
+    //雪冰变水
+    if (thisState.w <= 0 && thisState.w + Q / Cp > 0) {
+        if (thisState.w < 0) {
+            Q += Cp * thisState.w;
+        }
+        float deltaProportion = Q / Qwater;
+        //雪冰没有完全变成水
+        if ((thisState.x + thisState.z) - deltaProportion >= 0) {
+            Q = 0;
+            //优先融化雪
+            if (thisState.x - deltaProportion >= 0)
+                states[index].x -= deltaProportion;
+            else {
+                states[index].x = 0;
+                states[index].z -= deltaProportion - thisState.x;
+            }
+            states[index].y += deltaProportion;
+        }
+        //雪冰完全变成水
+        else {
+            Q -= Qwater * (thisState.x + thisState.z);
+            states[index].x = 0;
+            states[index].y = 1;
+            states[index].z = 0;
+        }
+    }
+    //水变冰
+    else if (thisState.w >= 0 && thisState.w + Q / Cp < 0) {
+        if (thisState.w > 0) {
+            Q += Cp * thisState.w;
+        }
+        float deltaProportion = -Q / Qwater;
+        //水没有完全变成冰
+        if (thisState.y - deltaProportion >= 0) {
+            Q = 0;
+            states[index].y -= deltaProportion;
+            states[index].z += deltaProportion;
+        }
+        //水完全变成冰
+        else {
+            Q += Qwater * thisState.y;
+            states[index].y = 0;
+            states[index].z = 1;
+        }
+    }
+    states[index].w += Q / Cp;
+}

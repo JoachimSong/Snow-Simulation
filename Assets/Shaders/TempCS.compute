@@ -1,0 +1,53 @@
+﻿#pragma kernel SetTemp
+#pragma kernel AddHeatSource
+
+RWTexture3D<float> tempTexture;
+
+uint3 gridCount;
+float gridSize;
+float3 gridStartPos;
+float temp;
+
+//float3 sourcePosition;
+//float sourceTemp;
+//float sourceRadius;
+
+#define THREAD_X 8
+#define THREAD_Y 8
+#define THREAD_Z 8
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void SetTemp(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= gridCount.x || id.y >= gridCount.y || id.z >= gridCount.z)
+		return;
+	float3 sourcePosition1 = float3(-3, 0, 3);
+	float3 sourcePosition2 = float3(-3, 0, -3);
+	float sourceTemp1 = 500;
+	float sourceTemp2 = -500;
+	float sourceRadius = 3;
+
+
+	tempTexture[id] = temp;
+
+	float3 textureSize = gridSize * gridCount;
+	float3 pos = gridStartPos + id * gridSize + 0.5 * float3(gridSize, gridSize, gridSize);
+	float dist1 = distance(pos, sourcePosition1);
+	float dist2 = distance(pos, sourcePosition2);
+	if (dist1 < sourceRadius)
+		tempTexture[id] += sourceTemp1 * (1 - dist1 / sourceRadius);
+	if (dist2 < sourceRadius)
+		tempTexture[id] += sourceTemp2 * (1 - dist2 / sourceRadius);
+}
+
+[numthreads(THREAD_X, THREAD_Y, THREAD_Z)]
+void AddHeatSource(uint3 id : SV_DispatchThreadID)
+{
+	/*float3 textureSize = gridSize * gridCount;
+	float3 pos = worldPos + id * gridSize - 0.5 * float3(textureSize.x, textureSize.y, textureSize.z) + 0.5 * float3(gridSize, gridSize, gridSize);
+	float dist = distance(pos, sourcePosition);
+
+	if (dist < sourceRadius)
+		tempTexture[id] += sourceTemp * (1 - dist / sourceRadius);*/
+}
+

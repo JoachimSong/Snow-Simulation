@@ -1,0 +1,4 @@
+repository "Snow Simulation@snow-simulation@cloud.cn"
+  path "/"
+    smartbranch "/main"  
+     
